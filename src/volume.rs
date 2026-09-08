@@ -1,7 +1,7 @@
 // Volume operations
 // Handles block device validation and superblock hashing
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
@@ -12,8 +12,45 @@ use crate::io;
 
 pub use crate::io::BlockRange;
 
-/// Validate that a path is a valid block device we can access
-pub fn validate_block_device(path: &Path) -> Result<()> {
+/// The access a volume must actually support for the operation being validated.
+///
+/// Preflight checks exist to fail before a destructive operation starts, so
+/// they have to open a volume the same way the operation will. The copy path
+/// opens the source `O_RDONLY` and the destination `O_WRONLY`; validating both
+/// with a read-only open would report a write-protected destination as ready
+/// and only fail once the copy is already under way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Source volumes, read by the copy path.
+    Read,
+    /// Destination volumes, written by the copy path.
+    Write,
+}
+
+impl Access {
+    /// Open `path` with the same access the real operation will request.
+    ///
+    /// Neither mode creates or truncates, so this is safe to call as a
+    /// preflight check: it proves the permission exists without touching data.
+    fn open(self, path: &Path) -> std::io::Result<File> {
+        let mut opts = OpenOptions::new();
+        match self {
+            Access::Read => opts.read(true),
+            Access::Write => opts.write(true),
+        };
+        opts.open(path)
+    }
+
+    fn verb(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::Write => "write to",
+        }
+    }
+}
+
+/// Validate that a path is a valid block device we can access in `access` mode
+pub fn validate_block_device(path: &Path, access: Access) -> Result<()> {
     let metadata =
         std::fs::metadata(path).wrap_err_with(|| format!("Cannot access {}", path.display()))?;
 
@@ -21,8 +58,10 @@ pub fn validate_block_device(path: &Path) -> Result<()> {
         return Err(eyre!("{} is not a block device", path.display()));
     }
 
-    // Try to open for read to check permissions
-    File::open(path).wrap_err_with(|| format!("Cannot read {}", path.display()))?;
+    // Try to open with the required access to check permissions
+    access
+        .open(path)
+        .wrap_err_with(|| format!("Cannot {} {}", access.verb(), path.display()))?;
 
     Ok(())
 }
@@ -80,11 +119,11 @@ pub fn mkfs_ext4(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Validate that a path exists and is accessible for reading and writing.
+/// Validate that a path exists and is accessible in `access` mode.
 /// Unlike `validate_block_device`, this does not require a block device — it
 /// also accepts regular files. Used for testing with file-backed images.
 #[cfg(test)]
-fn validate_volume(path: &Path) -> Result<()> {
+fn validate_volume(path: &Path, access: Access) -> Result<()> {
     let metadata =
         std::fs::metadata(path).wrap_err_with(|| format!("Cannot access {}", path.display()))?;
 
@@ -96,7 +135,9 @@ fn validate_volume(path: &Path) -> Result<()> {
         ));
     }
 
-    File::open(path).wrap_err_with(|| format!("Cannot read {}", path.display()))?;
+    access
+        .open(path)
+        .wrap_err_with(|| format!("Cannot {} {}", access.verb(), path.display()))?;
 
     Ok(())
 }
@@ -193,12 +234,40 @@ mod tests {
         let img = dir.path().join("test.img");
         create_image(&img, 1024);
 
-        assert!(validate_volume(&img).is_ok());
+        assert!(validate_volume(&img, Access::Read).is_ok());
+        assert!(validate_volume(&img, Access::Write).is_ok());
+    }
+
+    #[test]
+    fn validate_volume_write_rejects_read_only_target() {
+        // Regression test: a destination the copy path will open O_WRONLY must
+        // not pass preflight just because it can be opened for reading.
+        if nix::unistd::geteuid().is_root() {
+            // root bypasses the permission bits this test relies on.
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("scratch.img");
+        create_image(&img, 1024);
+
+        let mut perms = std::fs::metadata(&img).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&img, perms).unwrap();
+
+        assert!(
+            validate_volume(&img, Access::Read).is_ok(),
+            "read access should still be granted"
+        );
+        assert!(
+            validate_volume(&img, Access::Write).is_err(),
+            "write access must be rejected for a read-only destination"
+        );
     }
 
     #[test]
     fn validate_volume_rejects_nonexistent() {
-        let result = validate_volume(std::path::Path::new("/nonexistent/path"));
+        let result = validate_volume(std::path::Path::new("/nonexistent/path"), Access::Read);
         assert!(result.is_err());
     }
 
@@ -214,8 +283,8 @@ mod tests {
         create_image(&scratch, size);
 
         // Validate volumes
-        validate_volume(&virgin).unwrap();
-        validate_volume(&scratch).unwrap();
+        validate_volume(&virgin, Access::Read).unwrap();
+        validate_volume(&scratch, Access::Write).unwrap();
 
         // Sizes must match
         assert_eq!(get_size(&virgin).unwrap(), get_size(&scratch).unwrap());
@@ -248,8 +317,8 @@ mod tests {
         mkfs_ext4(&virgin).unwrap();
 
         // Validate
-        validate_volume(&virgin).unwrap();
-        validate_volume(&scratch).unwrap();
+        validate_volume(&virgin, Access::Read).unwrap();
+        validate_volume(&scratch, Access::Write).unwrap();
         assert_eq!(get_size(&virgin).unwrap(), get_size(&scratch).unwrap());
 
         // Copy
@@ -280,8 +349,8 @@ mod tests {
         full_copy(&virgin, &scratch, |_, _| {}).unwrap();
 
         // Now the --no-copy path: just validate and hash, no copy
-        validate_volume(&virgin).unwrap();
-        validate_volume(&scratch).unwrap();
+        validate_volume(&virgin, Access::Read).unwrap();
+        validate_volume(&scratch, Access::Write).unwrap();
         assert_eq!(get_size(&virgin).unwrap(), get_size(&scratch).unwrap());
 
         // Hash virgin (this is all init-from --no-copy does)

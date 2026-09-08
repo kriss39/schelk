@@ -63,9 +63,10 @@ pub async fn run(
         )?;
     }
 
-    // Validate volumes are valid block devices
-    volume::validate_block_device(&virgin)?;
-    volume::validate_block_device(&scratch)?;
+    // Validate volumes are valid block devices, with the access this command
+    // needs: the existing virgin is read, the scratch is overwritten.
+    volume::validate_block_device(&virgin, volume::Access::Read)?;
+    volume::validate_block_device(&scratch, volume::Access::Write)?;
 
     // Check that virgin and scratch volumes are the same size
     let virgin_size = volume::get_size(&virgin)?;

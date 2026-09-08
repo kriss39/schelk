@@ -55,11 +55,10 @@ pub async fn run(yes: bool) -> Result<()> {
         // re-trigger on the next run, which is the safe behavior.
     }
 
-    // Validate volumes are accessible
-    // TODO: here we need to read accessible virgin and write accessible scratch. Be more precise
-    // here.
-    volume::validate_block_device(&app_state.virgin)?;
-    volume::validate_block_device(&app_state.scratch)?;
+    // Validate volumes are accessible with the access the copy actually needs:
+    // the virgin is read, the scratch is overwritten.
+    volume::validate_block_device(&app_state.virgin, volume::Access::Read)?;
+    volume::validate_block_device(&app_state.scratch, volume::Access::Write)?;
 
     // Check sizes match
     let virgin_size = volume::get_size(&app_state.virgin)?;
